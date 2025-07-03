@@ -141,7 +141,11 @@ func ApplyActions(s *protos.OrchestrationRuntimeState, customStatus *wrapperspb.
 				})
 				if s.StartEvent.GetParentInstance() != nil {
 					msg := &protos.OrchestrationRuntimeStateMessage{
-						HistoryEvent:     &protos.HistoryEvent{EventId: -1, Timestamp: timestamppb.Now()},
+						HistoryEvent: &protos.HistoryEvent{
+							EventId:   -1,
+							Timestamp: timestamppb.Now(),
+							Router:    action.Router,
+						},
 						TargetInstanceID: s.StartEvent.GetParentInstance().OrchestrationInstance.InstanceId,
 					}
 					if completedAction.OrchestrationStatus == protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED {
