@@ -48,6 +48,9 @@ type OrchestrationContext struct {
 	bufferedExternalEvents     map[string]*list.List
 	pendingExternalEventTasks  map[string]*list.List
 	saveBufferedExternalEvents bool
+	branchVersions             map[string]int
+	newBranchVersions          map[string]int
+	incompatibleBranchVersion  bool
 }
 
 // callSubOrchestratorOptions is a struct that holds the options for the CallSubOrchestrator orchestrator method.
@@ -134,6 +137,8 @@ func NewOrchestrationContext(registry *TaskRegistry, id api.InstanceID, oldEvent
 		newEvents:                 newEvents,
 		bufferedExternalEvents:    make(map[string]*list.List),
 		pendingExternalEventTasks: make(map[string]*list.List),
+		branchVersions:            make(map[string]int),
+		newBranchVersions:         make(map[string]int),
 	}
 }
 
@@ -208,8 +213,13 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 
 	var err error = nil
 	if os := e.GetOrchestratorStarted(); os != nil {
-		// OrchestratorStarted is only used to update the current orchestration time
+		// OrchestratorStarted is only used to update the current orchestration time and branch versions
 		ctx.CurrentTimeUtc = e.Timestamp.AsTime()
+		if bv := os.GetBranchVersions(); bv != nil {
+			for _, v := range bv.GetVersions() {
+				ctx.branchVersions[v.GetName()] = int(v.GetNumber())
+			}
+		}
 	} else if es := e.GetExecutionStarted(); es != nil {
 		// Extract source AppID from HistoryEvent Router if this is ExecutionStartedEvent
 		if e.GetRouter() != nil {
@@ -512,6 +522,28 @@ func (ctx *OrchestrationContext) ContinueAsNew(newInput any, options ...Continue
 	for _, option := range options {
 		option(ctx)
 	}
+}
+
+func (ctx *OrchestrationContext) GetBranchVersion(branchName string, min, max int) int {
+	version, ok := ctx.branchVersions[branchName]
+	if !ok {
+		version, ok = ctx.newBranchVersions[branchName]
+	}
+	if ok {
+		if version < min || version > max {
+			ctx.incompatibleBranchVersion = true
+			panic(ErrTaskBlocked)
+		}
+		return version
+	}
+	totalEvents := len(ctx.oldEvents) + len(ctx.newEvents)
+	selected := max
+	if ctx.historyIndex < totalEvents {
+		// We're not at the end of the history stream, we assume the previous runs used the branch `min`
+		selected = min
+	}
+	ctx.newBranchVersions[branchName] = selected
+	return selected
 }
 
 func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedEvent) error {

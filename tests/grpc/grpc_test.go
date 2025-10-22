@@ -540,3 +540,31 @@ func Test_SingleActivity_TaskSpan(t *testing.T) {
 	// assert child-parent relationship
 	assert.Equal(t, spans[1].Parent().SpanID(), spans[2].SpanContext().SpanID())
 }
+
+func Test_Grpc_VersionedOrchestration(t *testing.T) {
+	r := task.NewTaskRegistry()
+	versions := []int{}
+	r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		version := ctx.GetBranchVersion("branch1", 1, 2)
+		versions = append(versions, version)
+		ctx.CallActivity("SayHello").Await(nil)
+		version = ctx.GetBranchVersion("branch1", 1, 3)
+		versions = append(versions, version)
+		return nil, nil
+	})
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	cancelListener := startGrpcListener(t, r)
+	defer cancelListener()
+
+	id, err := grpcClient.ScheduleNewOrchestration(ctx, "Orchestrator", api.WithInput("世界"))
+	require.NoError(t, err)
+	timeoutCtx, cancelTimeout := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelTimeout()
+	metadata, err := grpcClient.WaitForOrchestrationCompletion(timeoutCtx, id, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	assert.True(t, api.OrchestrationMetadataIsComplete(metadata))
+	assert.Equal(t, []int{2, 2, 2}, versions)
+}

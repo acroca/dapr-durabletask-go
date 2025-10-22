@@ -94,6 +94,21 @@ func (w *orchestratorProcessor) ProcessWorkItem(ctx context.Context, wi *Orchest
 			}
 			w.logger.Debugf("%v: orchestrator returned %d action(s): %s", wi.InstanceID, len(results.Actions), helpers.ActionListSummary(results.Actions))
 
+			// Backfill BranchVersions into the OrchestratorStarted event we added at the start of this turn
+			if results.BranchVersions != nil {
+				for _, e := range wi.State.NewEvents {
+					if os := e.GetOrchestratorStarted(); os != nil {
+						os.BranchVersions = results.BranchVersions
+						for _, v := range results.BranchVersions.Versions {
+							if err := helpers.StartAndEndNewBranchVersionSpan(ctx, v.GetName(), int(v.GetNumber()), e.Timestamp.AsTime()); err != nil {
+								w.logger.Warnf("%v: failed to generate distributed trace span for durable branch version: %v", wi.InstanceID, err)
+							}
+						}
+						break
+					}
+				}
+			}
+
 			// Apply the orchestrator outputs to the orchestration state.
 			continuedAsNew, err := runtimestate.ApplyActions(wi.State, results.CustomStatus, results.Actions, helpers.TraceContextFromSpan(span))
 			if err != nil {

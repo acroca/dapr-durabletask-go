@@ -12,6 +12,11 @@ import (
 // and commit its current execution progress to durable storage.
 var ErrTaskBlocked = errors.New("the current task is blocked")
 
+// ErrIncompatibleBranchVersion is a control signal meaning the orchestration code
+// detected a persisted branch version that is incompatible with this worker's supported range.
+// The backend should abandon this work item to allow a compatible worker to process it.
+var ErrIncompatibleBranchVersion = errors.New("incompatible branch version for this worker")
+
 // ErrTaskCanceled is used to indicate that a task was canceled. Tasks can be canceled, for example,
 // when configured timeouts expire.
 var ErrTaskCanceled = errors.New("the task was canceled") // CONSIDER: More specific info about the task

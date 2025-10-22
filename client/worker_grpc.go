@@ -159,6 +159,7 @@ func (c *TaskHubGrpcClient) processOrchestrationWorkItem(
 	} else {
 		resp.Actions = results.Actions
 		resp.CustomStatus = results.GetCustomStatus()
+		resp.BranchVersions = results.GetBranchVersions()
 	}
 
 	if _, err = c.client.CompleteOrchestratorTask(ctx, &resp); err != nil {

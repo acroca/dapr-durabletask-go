@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/dapr/durabletask-go/task"
 	"github.com/dapr/durabletask-go/tests/utils"
 	"go.opentelemetry.io/otel"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var tracer = otel.Tracer("orchestration-test")
@@ -1541,7 +1543,307 @@ func Test_TaskExecutionId(t *testing.T) {
 		assert.NotEmpty(t, executionId)
 		uuid.MustParse(executionId)
 	})
+}
 
+func Test_VersionedOrchestration_DefaultToLatestVersion(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	versionsFound := []int{}
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		version := ctx.GetBranchVersion("branch1", 1, 10)
+		versionsFound = append(versionsFound, version)
+
+		return nil, nil
+	}))
+
+	// Initialization
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, []int{10}, versionsFound)
+}
+
+func Test_VersionedOrchestration_ConsistentAcrossRuns(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	runNumber := atomic.Uint32{}
+	versionsFound := []int{}
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		currentRun := runNumber.Add(1)
+		var version int
+		// Simulate a version upgrade across runs, first run supports version 1 and 2, following runs support version 1, 2 and 3
+		// It's expected to respect first run, and receive version 2 in the second run.
+		if currentRun == 1 {
+			version = ctx.GetBranchVersion("branch1", 1, 2)
+		} else {
+			version = ctx.GetBranchVersion("branch1", 1, 3)
+		}
+		versionsFound = append(versionsFound, version)
+		ctx.CallActivity("SayHello").Await(nil)
+
+		return nil, nil
+	}))
+
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	// Initialization
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, uint32(2), runNumber.Load())
+	assert.Equal(t, []int{2, 2}, versionsFound)
+}
+
+func Test_VersionedOrchestration_MultipleBranches(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	runNumber := atomic.Uint32{}
+	versionsBranch1Found := []int{}
+	versionsBranch2Found := []int{}
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		currentRun := runNumber.Add(1)
+		var versionBranch1 int
+		if currentRun == 1 {
+			versionBranch1 = ctx.GetBranchVersion("branch1", 1, 2)
+		} else {
+			versionBranch1 = ctx.GetBranchVersion("branch1", 1, 3)
+		}
+		versionsBranch1Found = append(versionsBranch1Found, versionBranch1)
+		ctx.CallActivity("SayHello").Await(nil)
+		var versionBranch2 int
+		if currentRun == 2 {
+			versionBranch2 = ctx.GetBranchVersion("branch2", 1, 5)
+		} else {
+			versionBranch2 = ctx.GetBranchVersion("branch2", 1, 6)
+		}
+		versionsBranch2Found = append(versionsBranch2Found, versionBranch2)
+		ctx.CallActivity("SayHello").Await(nil)
+
+		return nil, nil
+	}))
+
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	// Initialization
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, uint32(3), runNumber.Load())
+	assert.Equal(t, []int{2, 2, 2}, versionsBranch1Found)
+	assert.Equal(t, []int{5, 5}, versionsBranch2Found)
+}
+
+func Test_VersionedOrchestration_MultipleChecksSameBranchVersion(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	versionBranchFound := 0
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		_ = ctx.GetBranchVersion("branch1", 1, 2)
+		ctx.CallActivity("SayHello").Await(nil)
+		// Same branch, but different range to ensure the previous value is returned.
+		versionBranchFound = ctx.GetBranchVersion("branch1", 1, 3)
+		return nil, nil
+	}))
+
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	// Initialization
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, 2, versionBranchFound)
+}
+
+func Test_VersionedOrchestration_VersioningInProcessWorkflowsWillRunFirstVersion(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	runNumber := atomic.Uint32{}
+	versionsFound := []int{}
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		currentRun := runNumber.Add(1)
+		var version int
+		if currentRun > 1 {
+			version = ctx.GetBranchVersion("branch1", 1, 3)
+		}
+		versionsFound = append(versionsFound, version)
+		ctx.CallActivity("SayHello").Await(nil)
+
+		return nil, nil
+	}))
+
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	// Initialization
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, uint32(2), runNumber.Load())
+	assert.Equal(t, []int{0, 1}, versionsFound)
+}
+
+func Test_VersionedOrchestration_IncompatibleVersion(t *testing.T) {
+	// Register orchestrator that expects versions in [1,2] (simulates old version of the app)
+	r := task.NewTaskRegistry()
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		_ = ctx.GetBranchVersion("branch1", 1, 2)
+		return nil, nil
+	}))
+
+	// Simulate a prior persisted version of 3, simulating the orchestrator ran first in a newer version of the app.
+	oldEvents := []*protos.HistoryEvent{
+		{
+			EventId:   -1,
+			Timestamp: timestamppb.Now(),
+			EventType: &protos.HistoryEvent_OrchestratorStarted{
+				OrchestratorStarted: &protos.OrchestratorStartedEvent{
+					BranchVersions: &protos.BranchVersions{
+						Versions: []*protos.Version{{Name: "branch1", Number: 3}},
+					},
+				},
+			},
+		},
+		{
+			EventId:   -1,
+			Timestamp: timestamppb.Now(),
+			EventType: &protos.HistoryEvent_ExecutionStarted{
+				ExecutionStarted: &protos.ExecutionStartedEvent{
+					Name:                  "Orchestrator",
+					OrchestrationInstance: &protos.OrchestrationInstance{InstanceId: "test-instance"},
+				},
+			},
+		},
+	}
+
+	executor := task.NewTaskExecutor(r)
+	resp, err := executor.ExecuteOrchestrator(context.Background(), api.InstanceID("test-instance"), oldEvents, nil)
+	t.Log("err", err)
+	require.ErrorIs(t, err, task.ErrIncompatibleBranchVersion)
+	assert.Nil(t, resp)
+}
+
+func Test_VersionedOrchestration_ContinueAsNewDoNotCarryOverVersionChoices(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	versionsFound := []int{}
+	ranContinueAsNew := false
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		var version int
+		if !ranContinueAsNew {
+			version = ctx.GetBranchVersion("branch1", 1, 2)
+		} else {
+			version = ctx.GetBranchVersion("branch1", 1, 3)
+		}
+		versionsFound = append(versionsFound, version)
+		ctx.CallActivity("SayHello").Await(nil)
+		if !ranContinueAsNew {
+			ranContinueAsNew = true
+			ctx.ContinueAsNew(nil)
+		}
+		return nil, nil
+	}))
+
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	// Initialization
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, []int{2, 2, 3, 3}, versionsFound)
+}
+
+func Test_VersionedOrchestration_TracingSpans(t *testing.T) {
+	// Registration
+	r := task.NewTaskRegistry()
+	require.NoError(t, r.AddOrchestratorN("Orchestrator", func(ctx *task.OrchestrationContext) (any, error) {
+		ctx.GetBranchVersion("branch1", 1, 10)
+		ctx.CallActivity("SayHello").Await(nil)
+		ctx.GetBranchVersion("branch2", 1, 10)
+		ctx.CallActivity("SayHello").Await(nil)
+		ctx.GetBranchVersion("branch3", 1, 10)
+		ctx.CallActivity("SayHello").Await(nil)
+		return nil, nil
+	}))
+	r.AddActivityN("SayHello", func(ctx task.ActivityContext) (any, error) {
+		return "Hello", nil
+	})
+
+	// Initialization
+	ctx := context.Background()
+	exporter := utils.InitTracing()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	// Run the orchestration
+	id, err := client.ScheduleNewOrchestration(ctx, "Orchestrator")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+
+	// Validate the exported OTel traces
+	spans := exporter.GetSpans().Snapshots()
+	utils.AssertSpanSequence(t, spans,
+		utils.AssertOrchestratorCreated("Orchestrator", id),
+		utils.AssertBranchVersion("branch1", 10),
+		utils.AssertActivity("SayHello", id, 0),
+		utils.AssertBranchVersion("branch2", 10),
+		utils.AssertActivity("SayHello", id, 1),
+		utils.AssertBranchVersion("branch3", 10),
+		utils.AssertActivity("SayHello", id, 2),
+		utils.AssertOrchestratorExecuted("Orchestrator", id, "COMPLETED"),
+	)
 }
 
 func initTaskHubWorker(ctx context.Context, r *task.TaskRegistry, opts ...backend.NewTaskWorkerOptions) (backend.TaskHubClient, backend.TaskHubWorker) {

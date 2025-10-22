@@ -131,12 +131,31 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*protos.OrchestratorResponse, error) {
 	orchestrationCtx := NewOrchestrationContext(te.Registry, id, oldEvents, newEvents)
 	actions := orchestrationCtx.start()
+	if orchestrationCtx.incompatibleBranchVersion {
+		// Signal backend to abandon this work item so a compatible worker can pick it up.
+		return nil, ErrIncompatibleBranchVersion
+	}
 
-	return &protos.OrchestratorResponse{
+	response := &protos.OrchestratorResponse{
 		InstanceId:   string(id),
 		Actions:      actions,
 		CustomStatus: wrapperspb.String(orchestrationCtx.customStatus),
-	}, nil
+	}
+
+	if len(orchestrationCtx.newBranchVersions) > 0 {
+		branchVersions := &protos.BranchVersions{
+			Versions: []*protos.Version{},
+		}
+		for branchName, version := range orchestrationCtx.newBranchVersions {
+			branchVersions.Versions = append(branchVersions.Versions, &protos.Version{
+				Name:   branchName,
+				Number: uint32(version),
+			})
+		}
+		response.BranchVersions = branchVersions
+	}
+
+	return response, nil
 }
 
 func (te taskExecutor) Shutdown(ctx context.Context) error {

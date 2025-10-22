@@ -68,6 +68,16 @@ func StartAndEndNewTimerSpan(ctx context.Context, tf *protos.TimerFiredEvent, cr
 	return nil
 }
 
+func StartAndEndNewBranchVersionSpan(ctx context.Context, branchName string, version int, createdTime time.Time) error {
+	attributes := []attribute.KeyValue{
+		{Key: "durabletask.branch_version", Value: attribute.StringValue(branchName)},
+		{Key: "durabletask.branch_version_number", Value: attribute.IntValue(version)},
+	}
+	_, span := startNewSpan(ctx, "branch_version", branchName, "", attributes, trace.SpanKindInternal, createdTime)
+	span.End()
+	return nil
+}
+
 func startNewSpan(
 	ctx context.Context,
 	taskType string,
