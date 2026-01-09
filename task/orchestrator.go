@@ -27,6 +27,7 @@ type Orchestrator func(ctx *OrchestrationContext) (any, error)
 type OrchestrationContext struct {
 	ID             api.InstanceID
 	Name           string
+	VersionName    string
 	IsReplaying    bool
 	CurrentTimeUtc time.Time
 	appID          *string
@@ -219,6 +220,9 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 		if version := os.GetVersion(); version != nil {
 			for _, p := range version.GetPatches() {
 				ctx.historyPatches[p] = true
+			}
+			if version.GetName() != "" {
+				ctx.VersionName = version.GetName()
 			}
 		}
 	} else if es := e.GetExecutionStarted(); es != nil {
@@ -564,12 +568,20 @@ func (ctx *OrchestrationContext) getOrchestrator(es *protos.ExecutionStartedEven
 	}
 
 	if versions, ok := ctx.registry.versionedOrchestrators[es.Name]; ok {
-		if latest, ok := ctx.registry.latestVersionedOrchestrators[es.Name]; ok {
-			if orchestrator, ok = versions[latest]; ok {
-				return orchestrator, nil
-			}
+		versionToUse := ""
+		if ctx.VersionName != "" {
+			versionToUse = ctx.VersionName
 		} else {
-			return nil, fmt.Errorf("versioned orchestrator '%s' does not have a latest version registered", es.Name)
+			if latest, ok := ctx.registry.latestVersionedOrchestrators[es.Name]; ok {
+				versionToUse = latest
+			} else {
+				return nil, fmt.Errorf("versioned orchestrator '%s' does not have a latest version registered", es.Name)
+			}
+		}
+
+		if orchestrator, ok = versions[versionToUse]; ok {
+			ctx.VersionName = versionToUse
+			return orchestrator, nil
 		}
 	}
 
